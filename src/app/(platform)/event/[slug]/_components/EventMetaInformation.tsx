@@ -1,0 +1,128 @@
+'use client'
+
+import type { Event } from '@/types'
+import { useQuery } from '@tanstack/react-query'
+import { Clock3Icon } from 'lucide-react'
+import { useMemo } from 'react'
+import { NewBadge } from '@/components/ui/new-badge'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { formatDate } from '@/lib/formatters'
+import { isMarketNew } from '@/lib/utils'
+
+interface EventMetaInformationProps {
+  event: Event
+}
+
+export default function EventMetaInformation({ event }: EventMetaInformationProps) {
+  const volumeRequestPayload = useMemo(() => {
+    const conditions = event.markets
+      .map((market) => {
+        const tokenIds = (market.outcomes ?? [])
+          .map(outcome => outcome.token_id)
+          .filter(Boolean)
+          .slice(0, 2)
+        if (!market.condition_id || tokenIds.length < 2) {
+          return null
+        }
+        return {
+          condition_id: market.condition_id,
+          token_ids: tokenIds as [string, string],
+        }
+      })
+      .filter((item): item is { condition_id: string, token_ids: [string, string] } => item !== null)
+
+    const signature = conditions
+      .map(condition => `${condition.condition_id}:${condition.token_ids.join(':')}`)
+      .join('|')
+
+    return { conditions, signature }
+  }, [event.markets])
+
+  const { data: volumeFromApi } = useQuery({
+    queryKey: ['trade-volumes', event.id, volumeRequestPayload.signature],
+    enabled: volumeRequestPayload.conditions.length > 0,
+    staleTime: 60_000,
+    refetchInterval: 60_000,
+    queryFn: async () => {
+      const response = await fetch(`${process.env.CLOB_URL}/data/volumes`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          include_24h: false,
+          conditions: volumeRequestPayload.conditions,
+        }),
+      })
+
+      const payload = await response.json() as Array<{
+        condition_id: string
+        status: number
+        volume?: string
+      }>
+
+      return payload
+        .filter(entry => entry?.status === 200)
+        .reduce((total, entry) => {
+          const numeric = Number(entry.volume ?? 0)
+          return Number.isFinite(numeric) ? total + numeric : total
+        }, 0)
+    },
+  })
+
+  const resolvedVolume = useMemo(() => {
+    if (typeof volumeFromApi === 'number' && Number.isFinite(volumeFromApi)) {
+      return volumeFromApi
+    }
+    return event.volume
+  }, [event.volume, volumeFromApi])
+
+  const hasRecentMarket = event.markets.some(
+    market => isMarketNew(market.created_at),
+  )
+  const expiryTooltip = 'This is estimated end date.<br>See rules below for specific resolution details.'
+  const formattedVolume = Number.isFinite(resolvedVolume)
+    ? (resolvedVolume || 0).toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      })
+    : '0.00'
+  const volumeLabel = `$${formattedVolume} Vol.`
+
+  const maybeEndDate = event.end_date ? new Date(event.end_date) : null
+  const expiryDate = maybeEndDate && !Number.isNaN(maybeEndDate.getTime()) ? maybeEndDate : null
+
+  return (
+    <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+      {hasRecentMarket
+        ? (
+            <NewBadge
+              variant="soft"
+              className="rounded-sm p-2"
+            />
+          )
+        : <span className="text-sm font-semibold text-muted-foreground">{volumeLabel}</span>}
+      {expiryDate && (
+        <Tooltip>
+          <TooltipTrigger>
+            <div className="flex items-center gap-1.5 text-sm leading-tight font-semibold text-muted-foreground">
+              <Clock3Icon className="size-4 text-muted-foreground" strokeWidth={2.5} />
+              <span>{formatDate(expiryDate)}</span>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent
+            side="bottom"
+            sideOffset={8}
+            hideArrow
+            className="border border-border bg-background px-3 py-2 text-xs font-semibold text-foreground shadow-xl"
+          >
+            <p
+              dangerouslySetInnerHTML={{ __html: expiryTooltip! }}
+              className="text-center"
+            />
+          </TooltipContent>
+        </Tooltip>
+      )}
+    </div>
+  )
+}
