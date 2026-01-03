@@ -230,12 +230,23 @@ export default function EventRelated({ event }: EventRelatedProps) {
       return
     }
 
+    const container = scrollContainerRef.current
+    if (!container) {
+      return
+    }
+
     const activeButton = buttonRefs.current[activeIndex]
     if (!activeButton) {
       return
     }
 
-    activeButton.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' })
+    const containerRect = container.getBoundingClientRect()
+    const buttonRect = activeButton.getBoundingClientRect()
+    const targetLeft = activeButton.offsetLeft - (containerRect.width / 2) + (buttonRect.width / 2)
+    const maxLeft = Math.max(0, container.scrollWidth - container.clientWidth)
+    const clampedLeft = Math.min(Math.max(0, targetLeft), maxLeft)
+
+    container.scrollTo({ left: clampedLeft, behavior: 'smooth' })
   }, [activeIndex])
 
   function handleTagClick(slug: string) {

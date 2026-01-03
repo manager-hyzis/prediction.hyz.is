@@ -1,5 +1,6 @@
 'use client'
 
+import Image from 'next/image'
 import Link from 'next/link'
 import { useEffect, useState } from 'react'
 
@@ -11,20 +12,17 @@ export default function TestModeBanner({
   persistKey = 'test_mode_banner_closed_session',
 }: TestModeBannerProps) {
   const [visible, setVisible] = useState<boolean | null>(null)
+  const discordUrl = 'https://discord.gg/vSSnkJvypS'
   const message = (
     <>
-      You’re in test mode (no real value).
+      Test mode is
       {' '}
-      <Link
-        href="https://faucet.circle.com/"
-        target="_blank"
-        rel="noreferrer"
-        className="font-semibold text-primary underline-offset-4 hover:underline"
-      >
-        Get free USDC
-      </Link>
+      <span className="font-bold">ON</span>
+      .
       {' '}
-      on Polygon Amoy.
+      Get free Amoy USDC in Discord with
+      {' '}
+      <span className="font-bold">/airdrop</span>
     </>
   )
 
@@ -50,10 +48,28 @@ export default function TestModeBanner({
       <div className="flex items-start gap-3 px-4 py-3">
         <div className="flex flex-col gap-2">
           <p className="text-sm leading-relaxed">
-            <span className="font-semibold text-destructive">Heads up:</span>
-            {' '}
             {message}
           </p>
+          <Link
+            href={discordUrl}
+            target="_blank"
+            rel="noreferrer"
+            className={`
+              inline-flex w-fit items-center gap-2 rounded-md bg-[#5865F2] px-3 py-1.5 text-xs font-semibold text-white
+              transition
+              hover:bg-[#4752C4]
+            `}
+          >
+            <Image
+              src="/images/deposit/social-media/discord.svg"
+              alt=""
+              width={14}
+              height={14}
+              className="size-3.5 shrink-0 brightness-0 invert"
+              aria-hidden="true"
+            />
+            Open Discord
+          </Link>
         </div>
         <button
           type="button"

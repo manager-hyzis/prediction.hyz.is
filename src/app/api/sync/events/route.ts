@@ -1,9 +1,6 @@
-import { and, desc, eq, gt, sql } from 'drizzle-orm'
 import { NextResponse } from 'next/server'
 import { isCronAuthorized } from '@/lib/auth-cron'
-import { uploadToR2 } from '@/lib/r2'
-import { db } from '@/lib/drizzle'
-import * as schema from '@/lib/db/schema'
+import { supabaseAdmin } from '@/lib/supabase'
 
 export const maxDuration = 300
 
@@ -50,10 +47,10 @@ function getAllowedCreators(): string[] {
 /**
  * 🔄 Market Synchronization Script for Vercel Functions
  *
- * This function syncs prediction markets from the Goldsky PnL subgraph to PostgreSQL via Drizzle ORM:
+ * This function syncs prediction markets from the Goldsky PnL subgraph to Supabase:
  * - Fetches new markets from blockchain via subgraph (INCREMENTAL)
  * - Downloads metadata and images from Irys/Arweave
- * - Stores everything in PostgreSQL database and Cloudflare R2 storage
+ * - Stores everything in Supabase database and storage
  */
 export async function GET(request: Request) {
   const auth = request.headers.get('authorization')
@@ -122,23 +119,18 @@ export async function GET(request: Request) {
 }
 
 async function getLastUpdatedAt() {
-  const result = await db
-    .select({ updated_at: schema.subgraph_syncs.updated_at })
-    .from(schema.subgraph_syncs)
-    .where(
-      and(
-        eq(schema.subgraph_syncs.service_name, 'market_sync'),
-        eq(schema.subgraph_syncs.subgraph_name, 'pnl'),
-      ),
-    )
-    .limit(1)
+  const { data, error } = await supabaseAdmin
+    .from('subgraph_syncs')
+    .select('updated_at')
+    .eq('service_name', 'market_sync')
+    .eq('subgraph_name', 'pnl')
+    .maybeSingle()
 
-  if (result.length === 0) {
-    return 0
+  if (error && error.code !== 'PGRST116') {
+    throw new Error(`Failed to get last processed timestamp: ${error.message}`)
   }
 
-  const timestamp = result[0].updated_at
-  return timestamp ? Math.floor(new Date(timestamp).getTime() / 1000) : 0
+  return data?.updated_at || 0
 }
 
 async function syncMarkets(): Promise<SyncStats> {
@@ -253,18 +245,19 @@ async function syncMarkets(): Promise<SyncStats> {
 }
 
 async function getLastProcessedConditionCursor(): Promise<SyncCursor | null> {
-  const result = await db
-    .select({ id: schema.conditions.id, updated_at: schema.conditions.updated_at })
-    .from(schema.conditions)
-    .orderBy(desc(schema.conditions.updated_at), desc(schema.conditions.id))
+  const { data, error } = await supabaseAdmin
+    .from('conditions')
+    .select('id, updated_at')
+    .order('updated_at', { ascending: false })
+    .order('id', { ascending: false })
     .limit(1)
+    .maybeSingle()
 
-  if (result.length === 0) {
-    return null
+  if (error && error.code !== 'PGRST116') {
+    throw new Error(`Failed to get last processed condition: ${error.message}`)
   }
 
-  const data = result[0]
-  if (!data.id || !data.updated_at) {
+  if (!data?.id || !data?.updated_at) {
     return null
   }
 
@@ -403,34 +396,25 @@ async function processCondition(market: SubgraphCondition) {
   }
   const updatedAtIso = new Date(updatedAtTimestamp * 1000).toISOString()
 
-  await db
-    .insert(schema.conditions)
-    .values({
-      id: market.id,
-      oracle: market.oracle,
-      question_id: market.questionId,
-      resolved: market.resolved,
-      arweave_hash: market.arweaveHash,
-      creator: market.creator!,
-      created_at: new Date(createdAtIso),
-      updated_at: new Date(updatedAtIso),
-    })
-    .onConflictDoUpdate({
-      target: schema.conditions.id,
-      set: {
-        oracle: market.oracle,
-        question_id: market.questionId,
-        resolved: market.resolved,
-        arweave_hash: market.arweaveHash,
-        creator: market.creator!,
-        updated_at: new Date(updatedAtIso),
-      },
-    })
+  const { error } = await supabaseAdmin.from('conditions').upsert({
+    id: market.id,
+    oracle: market.oracle,
+    question_id: market.questionId,
+    resolved: market.resolved,
+    arweave_hash: market.arweaveHash,
+    creator: market.creator!,
+    created_at: createdAtIso,
+    updated_at: updatedAtIso,
+  })
+
+  if (error) {
+    throw new Error(`Failed to create/update condition: ${error.message}`)
+  }
 
   console.log(`Processed condition: ${market.id}`)
 }
 
-function normalizeEventEndDate(rawValue: unknown): string | null {
+function normalizeTimestamp(rawValue: unknown): string | null {
   if (typeof rawValue === 'string') {
     const trimmed = rawValue.trim()
     if (trimmed) {
@@ -458,20 +442,19 @@ async function processEvent(eventData: any, creatorAddress: string) {
     throw new Error(`Invalid event data: ${JSON.stringify(eventData)}`)
   }
 
-  const normalizedEndDate = normalizeEventEndDate(eventData.end_time)
+  const normalizedEndDate = normalizeTimestamp(eventData.end_time)
   const enableNegRiskFlag = normalizeBooleanField(eventData.enable_neg_risk)
   const negRiskAugmentedFlag = normalizeBooleanField(eventData.neg_risk_augmented)
   const eventNegRiskFlag = normalizeBooleanField(eventData.neg_risk)
   const eventNegRiskMarketId = normalizeHexField(eventData.neg_risk_market_id)
 
-  const existingEvents = await db
-    .select({ id: schema.events.id, end_date: schema.events.end_date })
-    .from(schema.events)
-    .where(eq(schema.events.slug, eventData.slug))
-    .limit(1)
+  const { data: existingEvent } = await supabaseAdmin
+    .from('events')
+    .select('id, end_date')
+    .eq('slug', eventData.slug)
+    .maybeSingle()
 
-  if (existingEvents.length > 0) {
-    const existingEvent = existingEvents[0]
+  if (existingEvent) {
     const updatePayload: Record<string, any> = {
       enable_neg_risk: enableNegRiskFlag,
       neg_risk_augmented: negRiskAugmentedFlag,
@@ -479,18 +462,17 @@ async function processEvent(eventData: any, creatorAddress: string) {
       neg_risk_market_id: eventNegRiskMarketId ?? null,
     }
 
-    if (normalizedEndDate && normalizedEndDate !== existingEvent.end_date?.toISOString()) {
-      updatePayload.end_date = new Date(normalizedEndDate)
+    if (normalizedEndDate && normalizedEndDate !== existingEvent.end_date) {
+      updatePayload.end_date = normalizedEndDate
     }
 
-    try {
-      await db
-        .update(schema.events)
-        .set(updatePayload)
-        .where(eq(schema.events.id, existingEvent.id))
-    }
-    catch (error) {
-      console.error(`Failed to update event ${existingEvent.id}:`, error)
+    const { error: updateError } = await supabaseAdmin
+      .from('events')
+      .update(updatePayload)
+      .eq('id', existingEvent.id)
+
+    if (updateError) {
+      console.error(`Failed to update event ${existingEvent.id}:`, updateError)
     }
 
     console.log(`Event ${eventData.slug} already exists, using existing ID: ${existingEvent.id}`)
@@ -504,9 +486,9 @@ async function processEvent(eventData: any, creatorAddress: string) {
 
   console.log(`Creating new event: ${eventData.slug} by creator: ${creatorAddress}`)
 
-  const newEvents = await db
-    .insert(schema.events)
-    .values({
+  const { data: newEvent, error } = await supabaseAdmin
+    .from('events')
+    .insert({
       slug: eventData.slug,
       title: eventData.title,
       creator: creatorAddress,
@@ -517,15 +499,18 @@ async function processEvent(eventData: any, creatorAddress: string) {
       neg_risk: eventNegRiskFlag,
       neg_risk_market_id: eventNegRiskMarketId ?? null,
       rules: eventData.rules || null,
-      end_date: normalizedEndDate ? new Date(normalizedEndDate) : null,
+      end_date: normalizedEndDate,
     })
-    .returning({ id: schema.events.id })
+    .select('id')
+    .single()
 
-  if (newEvents.length === 0 || !newEvents[0]?.id) {
-    throw new Error(`Event creation failed: no ID returned`)
+  if (error) {
+    throw new Error(`Failed to create event: ${error.message}`)
   }
 
-  const newEvent = newEvents[0]
+  if (!newEvent?.id) {
+    throw new Error(`Event creation failed: no ID returned`)
+  }
 
   console.log(`Created event ${eventData.slug} with ID: ${newEvent.id}`)
 
@@ -541,13 +526,11 @@ async function processMarketData(market: SubgraphCondition, metadata: any, event
     throw new Error(`Invalid eventId: ${eventId}. Event must be created first.`)
   }
 
-  const existingMarkets = await db
-    .select({ condition_id: schema.markets.condition_id, event_id: schema.markets.event_id })
-    .from(schema.markets)
-    .where(eq(schema.markets.condition_id, market.id))
-    .limit(1)
-
-  const existingMarket = existingMarkets.length > 0 ? existingMarkets[0] : null
+  const { data: existingMarket } = await supabaseAdmin
+    .from('markets')
+    .select('condition_id, event_id')
+    .eq('condition_id', market.id)
+    .maybeSingle()
 
   const marketAlreadyExists = Boolean(existingMarket)
   const eventIdForStatusUpdate = existingMarket?.event_id ?? eventId
@@ -599,7 +582,9 @@ async function processMarketData(market: SubgraphCondition, metadata: any, event
   const metadataVersion = normalizeStringField(metadata.version)
   const metadataSchema = normalizeStringField(metadata.schema)
 
-  const marketData = {
+  const normalizedMarketEndTime = normalizeTimestamp(metadata.end_time)
+
+  const marketData: Record<string, any> = {
     condition_id: market.id,
     event_id: eventId,
     is_resolved: market.resolved,
@@ -620,37 +605,19 @@ async function processMarketData(market: SubgraphCondition, metadata: any, event
     neg_risk_request_id: negRiskRequestId ?? null,
     metadata_version: metadataVersion ?? null,
     metadata_schema: metadataSchema ?? null,
-    created_at: new Date(createdAtIso),
-    updated_at: new Date(updatedAtIso),
+    created_at: createdAtIso,
+    updated_at: updatedAtIso,
   }
 
-  await db
-    .insert(schema.markets)
-    .values(marketData)
-    .onConflictDoUpdate({
-      target: schema.markets.condition_id,
-      set: {
-        is_resolved: marketData.is_resolved,
-        is_active: marketData.is_active,
-        title: marketData.title,
-        slug: marketData.slug,
-        short_title: marketData.short_title,
-        icon_url: marketData.icon_url,
-        metadata: marketData.metadata,
-        question: marketData.question,
-        market_rules: marketData.market_rules,
-        resolution_source: marketData.resolution_source,
-        resolution_source_url: marketData.resolution_source_url,
-        resolver: marketData.resolver,
-        neg_risk: marketData.neg_risk,
-        neg_risk_other: marketData.neg_risk_other,
-        neg_risk_market_id: marketData.neg_risk_market_id,
-        neg_risk_request_id: marketData.neg_risk_request_id,
-        metadata_version: marketData.metadata_version,
-        metadata_schema: marketData.metadata_schema,
-        updated_at: marketData.updated_at,
-      },
-    })
+  if (normalizedMarketEndTime) {
+    marketData.end_time = normalizedMarketEndTime
+  }
+
+  const { error } = await supabaseAdmin.from('markets').upsert(marketData)
+
+  if (error) {
+    throw new Error(`Failed to create market: ${error.message}`)
+  }
 
   if (!marketAlreadyExists && metadata.outcomes?.length > 0) {
     await processOutcomes(market.id, metadata.outcomes)
@@ -666,25 +633,29 @@ async function updateEventStatusesFromMarketsBatch(eventIds: string[]) {
 }
 
 async function updateEventStatusFromMarkets(eventId: string) {
-  const totalCountResult = await db
-    .select({ count: sql<number>`cast(count(*) as int)` })
-    .from(schema.markets)
-    .where(eq(schema.markets.event_id, eventId))
+  const { count: totalCount, error: totalError } = await supabaseAdmin
+    .from('markets')
+    .select('condition_id', { count: 'exact', head: true })
+    .eq('event_id', eventId)
 
-  const totalCount = totalCountResult[0]?.count || 0
+  if (totalError) {
+    console.error(`Failed to compute market counts for event ${eventId}:`, totalError)
+    return
+  }
 
-  const activeCountResult = await db
-    .select({ count: sql<number>`cast(count(*) as int)` })
-    .from(schema.markets)
-    .where(and(
-      eq(schema.markets.event_id, eventId),
-      eq(schema.markets.is_active, true),
-    ))
+  const { count: activeCount, error: activeError } = await supabaseAdmin
+    .from('markets')
+    .select('condition_id', { count: 'exact', head: true })
+    .eq('event_id', eventId)
+    .or('is_active.eq.true,and(is_active.is.null,is_resolved.eq.false)')
 
-  const activeCount = activeCountResult[0]?.count || 0
+  if (activeError) {
+    console.error(`Failed to compute active market count for event ${eventId}:`, activeError)
+    return
+  }
 
-  const hasMarkets = totalCount > 0
-  const hasActiveMarket = activeCount > 0
+  const hasMarkets = (totalCount ?? 0) > 0
+  const hasActiveMarket = (activeCount ?? 0) > 0
 
   const nextStatus: 'draft' | 'active' | 'archived'
     = hasActiveMarket
@@ -693,10 +664,14 @@ async function updateEventStatusFromMarkets(eventId: string) {
         ? 'archived'
         : 'draft'
 
-  await db
-    .update(schema.events)
-    .set({ status: nextStatus })
-    .where(eq(schema.events.id, eventId))
+  const { error: updateError } = await supabaseAdmin
+    .from('events')
+    .update({ status: nextStatus })
+    .eq('id', eventId)
+
+  if (updateError) {
+    console.error(`Failed to update status for event ${eventId}:`, updateError)
+  }
 }
 
 async function processOutcomes(conditionId: string, outcomes: any[]) {
@@ -707,9 +682,11 @@ async function processOutcomes(conditionId: string, outcomes: any[]) {
     token_id: outcome.token_id || (`${conditionId}${index}`),
   }))
 
-  await db
-    .insert(schema.outcomes)
-    .values(outcomeData)
+  const { error } = await supabaseAdmin.from('outcomes').insert(outcomeData)
+
+  if (error) {
+    throw new Error(`Failed to create outcomes: ${error.message}`)
+  }
 }
 
 async function processTags(eventId: string, tagNames: any[]) {
@@ -722,38 +699,36 @@ async function processTags(eventId: string, tagNames: any[]) {
     const truncatedName = tagName.substring(0, 100)
     const slug = truncatedName.toLowerCase().replace(/[^a-z0-9]+/g, '-').substring(0, 100)
 
-    const existingTags = await db
-      .select({ id: schema.tags.id })
-      .from(schema.tags)
-      .where(eq(schema.tags.slug, slug))
-      .limit(1)
+    let { data: tag } = await supabaseAdmin
+      .from('tags')
+      .select('id')
+      .eq('slug', slug)
+      .maybeSingle()
 
-    let tagId: number
+    if (!tag) {
+      const { data: newTag, error } = await supabaseAdmin
+        .from('tags')
+        .insert({ name: truncatedName, slug })
+        .select('id')
+        .single()
 
-    if (existingTags.length > 0) {
-      tagId = existingTags[0].id
-    }
-    else {
-      const newTags = await db
-        .insert(schema.tags)
-        .values({ name: truncatedName, slug })
-        .returning({ id: schema.tags.id })
-
-      if (newTags.length === 0) {
-        console.error(`Failed to create tag`)
+      if (error) {
+        console.error(`Failed to create tag ${truncatedName}:`, error)
         continue
       }
-
-      tagId = newTags[0].id
+      tag = newTag
     }
 
-    await db
-      .insert(schema.event_tags)
-      .values({
+    await supabaseAdmin.from('event_tags').upsert(
+      {
         event_id: eventId,
-        tag_id: tagId,
-      })
-      .onConflictDoNothing()
+        tag_id: tag.id,
+      },
+      {
+        onConflict: 'event_id,tag_id',
+        ignoreDuplicates: true,
+      },
+    )
   }
 }
 
@@ -771,7 +746,18 @@ async function downloadAndSaveImage(arweaveHash: string, storagePath: string) {
 
     const imageBuffer = await response.arrayBuffer()
 
-    await uploadToR2(storagePath, imageBuffer, 'image/jpeg')
+    const { error } = await supabaseAdmin.storage
+      .from('forkast-assets')
+      .upload(storagePath, imageBuffer, {
+        contentType: 'image/jpeg',
+        cacheControl: '31536000',
+        upsert: true,
+      })
+
+    if (error) {
+      console.error(`Failed to upload image: ${error.message}`)
+      return null
+    }
 
     return storagePath
   }
@@ -829,21 +815,20 @@ function normalizeBooleanField(value: unknown): boolean {
 }
 
 async function checkSyncRunning(): Promise<boolean> {
-  const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000)
-  const result = await db
-    .select({ status: schema.subgraph_syncs.status })
-    .from(schema.subgraph_syncs)
-    .where(
-      and(
-        eq(schema.subgraph_syncs.service_name, 'market_sync'),
-        eq(schema.subgraph_syncs.subgraph_name, 'pnl'),
-        eq(schema.subgraph_syncs.status, 'running'),
-        gt(schema.subgraph_syncs.updated_at, fifteenMinutesAgo),
-      ),
-    )
-    .limit(1)
+  const { data, error } = await supabaseAdmin
+    .from('subgraph_syncs')
+    .select('status')
+    .eq('service_name', 'market_sync')
+    .eq('subgraph_name', 'pnl')
+    .eq('status', 'running')
+    .gt('updated_at', new Date(Date.now() - 15 * 60 * 1000).toISOString())
+    .maybeSingle()
 
-  return result.length > 0
+  if (error && error.code !== 'PGRST116') {
+    throw new Error(`Failed to check sync status: ${error.message}`)
+  }
+
+  return Boolean(data)
 }
 
 async function updateSyncStatus(
@@ -851,12 +836,13 @@ async function updateSyncStatus(
   errorMessage?: string | null,
   totalProcessed?: number,
 ) {
-  const updateData: Record<string, any> = {
+  const updateData: any = {
+    service_name: 'market_sync',
+    subgraph_name: 'pnl',
     status,
-    updated_at: new Date(),
   }
 
-  if (errorMessage) {
+  if (errorMessage !== undefined) {
     updateData.error_message = errorMessage
   }
 
@@ -864,30 +850,13 @@ async function updateSyncStatus(
     updateData.total_processed = totalProcessed
   }
 
-  const existingSync = await db
-    .select({ id: schema.subgraph_syncs.id })
-    .from(schema.subgraph_syncs)
-    .where(
-      and(
-        eq(schema.subgraph_syncs.service_name, 'market_sync'),
-        eq(schema.subgraph_syncs.subgraph_name, 'pnl'),
-      ),
-    )
-    .limit(1)
+  const { error } = await supabaseAdmin
+    .from('subgraph_syncs')
+    .upsert(updateData, {
+      onConflict: 'service_name,subgraph_name',
+    })
 
-  if (existingSync.length > 0) {
-    await db
-      .update(schema.subgraph_syncs)
-      .set(updateData)
-      .where(eq(schema.subgraph_syncs.id, existingSync[0].id))
-  }
-  else {
-    await db
-      .insert(schema.subgraph_syncs)
-      .values({
-        service_name: 'market_sync',
-        subgraph_name: 'pnl',
-        ...updateData,
-      })
+  if (error) {
+    console.error(`Failed to update sync status to ${status}:`, error)
   }
 }

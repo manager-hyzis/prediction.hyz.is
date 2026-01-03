@@ -210,7 +210,15 @@ export default function EventMarkets({ event, isMobile }: EventMarketsProps) {
                 chanceHighlightKey={chanceHighlightKey}
               />
 
-              {isExpanded && (
+              <div
+                className={cn(
+                  'overflow-hidden transition-all duration-500 ease-in-out',
+                  isExpanded
+                    ? 'max-h-96 translate-y-0 opacity-100'
+                    : 'pointer-events-none max-h-0 -translate-y-2 opacity-0',
+                )}
+                aria-hidden={!isExpanded}
+              >
                 <MarketDetailTabs
                   market={market}
                   event={event}
@@ -228,7 +236,7 @@ export default function EventMarkets({ event, isMobile }: EventMarketsProps) {
                   }}
                   sharesByCondition={sharesByCondition}
                 />
-              )}
+              </div>
 
               {index !== orderedMarkets.length - 1 && (
                 <div className="mx-2 border-b border-border" />

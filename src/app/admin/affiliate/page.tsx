@@ -7,7 +7,7 @@ import { AffiliateRepository } from '@/lib/db/queries/affiliate'
 import { SettingsRepository } from '@/lib/db/queries/settings'
 import { fetchMaxExchangeBaseFeeRate } from '@/lib/exchange'
 import { usdFormatter } from '@/lib/formatters'
-import { getImageUrl } from '@/lib/image'
+import { getSupabaseImageUrl } from '@/lib/supabase'
 
 interface AffiliateOverviewRow {
   affiliate_user_id: string
@@ -107,7 +107,7 @@ export default async function AdminSettingsPage() {
       username: profile?.username as string,
       address: profile?.address ?? '',
       proxy_wallet_address: profile?.proxy_wallet_address ?? null,
-      image: profile?.image ? getImageUrl(profile.image) : `https://avatar.vercel.sh/${profileAddress || item.affiliate_user_id}.png`,
+      image: profile?.image ? getSupabaseImageUrl(profile.image) : `https://avatar.vercel.sh/${profileAddress || item.affiliate_user_id}.png`,
       affiliate_code: profile?.affiliate_code ?? null,
       total_referrals: Number(item.total_referrals ?? 0),
       volume: Number(item.volume ?? 0),

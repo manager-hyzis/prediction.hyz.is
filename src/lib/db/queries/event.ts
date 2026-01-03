@@ -9,12 +9,70 @@ import { comments } from '@/lib/db/schema/comments/tables'
 import { event_tags, events, markets, tags } from '@/lib/db/schema/events/tables'
 import { runQuery } from '@/lib/db/utils/run-query'
 import { db } from '@/lib/drizzle'
-import { getImageUrl } from '@/lib/image'
+import { getSupabaseImageUrl } from '@/lib/supabase'
 
 const HIDE_FROM_NEW_TAG_SLUG = 'hide-from-new'
 
 type PriceApiResponse = Record<string, { BUY?: string, SELL?: string } | undefined>
 interface OutcomePrices { buy: number, sell: number }
+const MAX_PRICE_BATCH = 500
+
+async function fetchPriceBatch(endpoint: string, tokenIds: string[]): Promise<PriceApiResponse | null> {
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify(tokenIds.map(tokenId => ({
+        token_id: tokenId,
+      }))),
+      cache: 'no-store',
+    })
+
+    if (!response.ok) {
+      return null
+    }
+
+    return await response.json() as PriceApiResponse
+  }
+  catch (error) {
+    console.error('Failed to fetch outcome prices batch from CLOB.', error)
+    return null
+  }
+}
+
+function applyPriceBatch(
+  data: PriceApiResponse | null,
+  priceMap: Map<string, OutcomePrices>,
+  missingTokenIds: Set<string>,
+) {
+  if (!data) {
+    return
+  }
+
+  for (const [tokenId, priceBySide] of Object.entries(data ?? {})) {
+    if (!priceBySide) {
+      continue
+    }
+
+    const parsedBuy = priceBySide.BUY != null ? Number(priceBySide.BUY) : undefined
+    const parsedSell = priceBySide.SELL != null ? Number(priceBySide.SELL) : undefined
+    const normalizedBuy = parsedBuy != null && Number.isFinite(parsedBuy) ? parsedBuy : undefined
+    const normalizedSell = parsedSell != null && Number.isFinite(parsedSell) ? parsedSell : undefined
+
+    if (normalizedBuy == null && normalizedSell == null) {
+      continue
+    }
+
+    priceMap.set(tokenId, {
+      buy: normalizedSell ?? normalizedBuy ?? 0.5,
+      sell: normalizedBuy ?? normalizedSell ?? 0.5,
+    })
+    missingTokenIds.delete(tokenId)
+  }
+}
 
 async function fetchOutcomePrices(tokenIds: string[]): Promise<Map<string, OutcomePrices>> {
   const uniqueTokenIds = Array.from(new Set(tokenIds.filter(Boolean)))
@@ -24,55 +82,33 @@ async function fetchOutcomePrices(tokenIds: string[]): Promise<Map<string, Outco
   }
 
   const endpoint = `${process.env.CLOB_URL!}/prices`
+  const priceMap = new Map<string, OutcomePrices>()
+  const missingTokenIds = new Set(uniqueTokenIds)
 
-  try {
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      },
-      body: JSON.stringify(uniqueTokenIds.map(tokenId => ({
-        token_id: tokenId,
-      }))),
-      cache: 'no-store',
-    })
-
-    if (!response.ok) {
-      return new Map(uniqueTokenIds.map(tokenId => [tokenId, { buy: 0.5, sell: 0.5 }]))
+  for (let i = 0; i < uniqueTokenIds.length; i += MAX_PRICE_BATCH) {
+    const batch = uniqueTokenIds.slice(i, i + MAX_PRICE_BATCH)
+    const batchData = await fetchPriceBatch(endpoint, batch)
+    if (batchData) {
+      applyPriceBatch(batchData, priceMap, missingTokenIds)
+      continue
     }
 
-    const data = await response.json() as PriceApiResponse
-    const priceMap = new Map<string, OutcomePrices>()
+    const tokenResults = await Promise.allSettled(
+      batch.map(tokenId => fetchPriceBatch(endpoint, [tokenId])),
+    )
 
-    for (const [tokenId, priceBySide] of Object.entries(data ?? {})) {
-      if (!priceBySide) {
-        continue
-      }
-
-      const parsedBuy = priceBySide.BUY != null ? Number(priceBySide.BUY) : undefined
-      const parsedSell = priceBySide.SELL != null ? Number(priceBySide.SELL) : undefined
-      const normalizedBuy = parsedBuy != null && Number.isFinite(parsedBuy) ? parsedBuy : undefined
-      const normalizedSell = parsedSell != null && Number.isFinite(parsedSell) ? parsedSell : undefined
-
-      priceMap.set(tokenId, {
-        buy: normalizedSell ?? normalizedBuy ?? 0.5,
-        sell: normalizedBuy ?? normalizedSell ?? 0.5,
-      })
-    }
-
-    for (const tokenId of uniqueTokenIds) {
-      if (!priceMap.has(tokenId)) {
-        priceMap.set(tokenId, { buy: 0.5, sell: 0.5 })
+    for (const result of tokenResults) {
+      if (result.status === 'fulfilled') {
+        applyPriceBatch(result.value, priceMap, missingTokenIds)
       }
     }
+  }
 
-    return priceMap
+  for (const tokenId of missingTokenIds) {
+    priceMap.set(tokenId, { buy: 0.5, sell: 0.5 })
   }
-  catch (error) {
-    console.error('Failed to fetch outcome prices from CLOB.', error)
-    return new Map(uniqueTokenIds.map(tokenId => [tokenId, { buy: 0.5, sell: 0.5 }]))
-  }
+
+  return priceMap
 }
 
 interface ListEventsProps {
@@ -151,6 +187,7 @@ function eventResource(event: DrizzleEventResult, userId: string, priceMap: Map<
       ...market,
       neg_risk: Boolean(market.neg_risk),
       neg_risk_other: Boolean(market.neg_risk_other),
+      end_time: market.end_time?.toISOString?.() ?? null,
       question_id: market.condition?.id || '',
       title: market.short_title || market.title,
       probability,
@@ -158,7 +195,7 @@ function eventResource(event: DrizzleEventResult, userId: string, priceMap: Map<
       volume: normalizedTotalVolume,
       volume_24h: normalizedCurrentVolume24h,
       outcomes: normalizedOutcomes,
-      icon_url: getImageUrl(market.icon_url),
+      icon_url: getSupabaseImageUrl(market.icon_url),
       condition: market.condition
         ? {
             ...market.condition,
@@ -186,7 +223,7 @@ function eventResource(event: DrizzleEventResult, userId: string, priceMap: Map<
     slug: event.slug || '',
     title: event.title || '',
     creator: event.creator || '',
-    icon_url: getImageUrl(event.icon_url),
+    icon_url: getSupabaseImageUrl(event.icon_url),
     show_market_icons: event.show_market_icons ?? true,
     enable_neg_risk: Boolean(event.enable_neg_risk),
     neg_risk_augmented: Boolean(event.neg_risk_augmented),
@@ -689,7 +726,7 @@ export const EventRepository = {
           id: String(row.id),
           slug: String(row.slug),
           title: String(row.title),
-          icon_url: getImageUrl(String(row.icon_url || '')),
+          icon_url: getSupabaseImageUrl(String(row.icon_url || '')),
           common_tags_count: Number(row.common_tags_count),
         }))
         .filter(event => event.common_tags_count > 0)

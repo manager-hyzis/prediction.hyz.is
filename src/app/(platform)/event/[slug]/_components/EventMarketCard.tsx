@@ -90,8 +90,8 @@ function EventMarketCardComponent({
     <div
       className={cn(
         `
-          flex w-full cursor-pointer flex-col items-start rounded-lg p-4 transition-all duration-200 ease-in-out
-          lg:flex-row lg:items-center
+          flex w-full cursor-pointer flex-col items-start p-4 transition-all duration-200 ease-in-out
+          lg:flex-row lg:items-center lg:rounded-lg
         `,
         'hover:bg-black/5 dark:hover:bg-white/5',
       )}
